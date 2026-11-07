@@ -1,4 +1,4 @@
-# MiTV4（Amlogic Utgard）—— 外部内存绑定缺少物理地址校验导致的本地提权
+# MiBox3S（Amlogic Utgard）—— 外部内存绑定缺少物理地址校验导致的本地提权
 
 [English](README.md) | **简体中文**
 
