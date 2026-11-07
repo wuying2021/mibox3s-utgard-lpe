@@ -1,4 +1,19 @@
+# build output
 gpu_arb_write
+gpu_scan
+gpwrite
+gpwrite64
 kfunc
+kfunc_new
+kfunc_check
+crash_for_core
 *.o
-.DS_Store
+*.d
+
+# never ship firmware / vendor blobs / device dumps
+*.img
+*.apk
+*.jar
+*.ko
+*.bak*
+*.log

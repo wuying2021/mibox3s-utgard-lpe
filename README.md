@@ -2,6 +2,12 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+> **This fork targets the Xiaomi Mi Box 3S** (MDZ-19-AA, build `8.2.2.817`, Android 6.0.1,
+> kernel `3.14.29-301318-g9206404`). `run.sh` already carries that firmware's two constants
+> (`SLOT_PHYS=1ee77a0`, `KLN_ADDR=ffffffc00111e5d0`) and drives the aarch64 helpers built by
+> this `Makefile`; §2.2 and [PORT_MIBOX3S.md](PORT_MIBOX3S.md) explain why the MiTV4
+> addresses used in the rest of this document do not apply to it.
+
 A complete, verified chain that turns an unprivileged `adb shell` (uid 2000,
 `u:r:shell:s0`) into `uid=0` with SELinux permissive on a **Xiaomi MiTV4**
 (Amlogic S905L2, Mali-400, Utgard DDK).
@@ -48,7 +54,57 @@ kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
 | Mitigations | no KASLR, **no PAN**, PXN present, `panic_on_oops=1`, no seccomp/userns/bpf |
 | Node perms | `/dev/mali` and `/dev/ion` are `crw-rw-rw-` (0666) |
 
-### 2.2 Condition for other devices
+### 2.2 Verified on (second device): Xiaomi Mi Box 3S
+
+| item | value |
+|---|---|
+| Model | Xiaomi **Mi Box 3S** (MDZ-19-AA), product `queenchristina` |
+| OS | Android **6.0.1** (SDK 23), vendor build `8.2.2.817`, security patch 2017-04-01 |
+| Kernel | Linux **3.14.29-301318-g9206404**, arm64, built 2018-02-02 |
+| SoC / GPU | Amlogic **S905X**, Mali-400, Amlogic Utgard DDK |
+| RAM | linear map `va = phys + 0xffffffc000000000` |
+| Mitigations | SELinux **Enforcing**, no seccomp, `CapEff=0` for `shell`; `/dev/mali` and `/dev/ion` are 0666 |
+| Result | `uid=0`, `context=u:r:kernel:s0`, `CapEff 0000001fffffffff` — see `PORT_MIBOX3S.md` |
+
+This device needs three extra steps that the MiTV4 does not; they are worth
+knowing before porting anywhere else:
+
+1. **`/dev/ion` mmap is broken on this firmware.** Every `mmap()` of an
+   ion/dma-buf fd returns the bogus address `0x400008` — even with `MAP_FIXED`.
+   The original `gpu_arb_write` therefore segfaults inside `build_shader()` and
+   **never submits a GPU job**; writes appear to "work sometimes" only when
+   `0x400008` happens to be mapped in that process. `src/gpwrite.c` avoids ion
+   entirely: the command buffer is a plain file page, its physical address comes
+   from `/proc/self/pagemap`, and it is attached to the GPU with the *external*
+   backend, followed by `__ARM_NR_cacheflush`.
+2. **`sys_call_table` is a hot cache line.** It is read on every syscall, so a
+   GPU (DMA) write lands in DRAM but the CPU keeps serving the old entry from
+   L1/L2. A scan of the whole `.data`/`.rodata` finds nothing until the cache is
+   evicted; `gpwrite64`/`kfunc_new` now walk an 8 MB buffer right before the
+   probe/call (`cache_thrash()`), after which the write is visible.
+3. **Bitness selects the table.** A 32-bit probe goes through
+   `compat_sys_call_table` (`.text`), a 64-bit one through `sys_call_table`.
+   Both the scanner and the caller must be aarch64.
+
+Firmware-specific addresses for this build:
+
+| symbol | address |
+|---|---|
+| `sys_call_table` (physical base) | `0x1ee7000` |
+| `sys_call_table[244]` (physical) | `0x1ee77a0` |
+| `kallsyms_lookup_name` | `0xffffffc00111e5d0` |
+| `memcpy` | `0xffffffc0013e1270` |
+| `selinux_enforcing` | `0xffffffc0020cff24` |
+| `core_pattern` | `0xffffffc001f1c0c8` |
+
+Do not copy MiTV4's addresses: its `0xffffffc00111f308` lands inside
+`do_acct_process.isra.4+0x368` here. `kfunc_new bt <addr>` turns
+`dump_backtrace` into a read-only `%pS` oracle (it prints `symbol+off/size` for
+any address without executing it), which is how `kallsyms_lookup_name` was
+located on this build.
+
+### 2.3 Condition for other devices
+
 
 Any device is affected if **all** of these hold:
 
@@ -163,11 +219,18 @@ Additional measured facts:
 
 ### 4.2 Cache coherency — the trap
 
-- **cold** data (`lease_break_time`, `core_pattern`, `sys_call_table`): the GPU
-  DMA write takes effect immediately;
+- **cold** data (`lease_break_time`, `core_pattern`): the GPU DMA write takes
+  effect immediately;
 - **hot** variables read on every permission check (`selinux_enforcing`,
   `panic_on_oops`): the GPU write has **no effect** — `getenforce` keeps
   returning `Enforcing`, because the CPU keeps serving the value from its cache.
+- `sys_call_table` sits in between and **must not be assumed cold**. It is read
+  on every syscall, so its cache line is resident: on the Mi Box 3S a DMA write
+  into the table is invisible until that line is evicted, and a page scan of the
+  entire `.data`/`.rodata` finds nothing. Walking a buffer a few MB wide right
+  before the probe/call (`cache_thrash()` in `src/gpwrite.c` and `src/kfunc.c`)
+  forces the eviction, after which the entry is reloaded from DRAM and the
+  hijack takes effect.
 
 That is why the final step must be a **CPU-side** write (through the hijacked
 `memcpy`), not a GPU write. Hours were lost to this; do not skip it.
@@ -414,11 +477,18 @@ where the driver is fixed.
 
 | file | target | purpose |
 |---|---|---|
-| `src/gpu_arb_write.c` | armv7 | arbitrary physical 128-byte write via the Utgard write-back unit |
+| `src/gpwrite.c` | aarch64 | ion-free writer: file page + `/proc/self/pagemap` + external bind (required on Mi Box 3S) |
+| `src/gpu_arb_write.c` | armv7 | arbitrary physical 128-byte write via the Utgard write-back unit (ion path) |
+| `src/gpu_scan.c` | armv7 | in-process probe loop that locates `sys_call_table[244]` |
 | `src/kfunc.c` | aarch64 | call a kernel function through unused `sys_call_table` slots |
-| `run.sh` | — | drives the whole chain |
+| `src/crash_for_core.c` | armv7 | raise `RLIMIT_CORE` and die with SIGSEGV so `core_pattern` fires |
+| `src/kread.c` | aarch64 | 3-argument caller for the physmap canary payload (address discovery) |
+| `run.sh` | — | drives the whole chain (Mi Box 3S constants) |
 | `roothelper.sh` | — | runs as root from `core_pattern`; installs `su`, fixes adb |
+| `root_cmd.sh` | — | example payload for the helper (starts `tvagent`) |
 | `Makefile` | — | build, including a `zig` target |
+| `PORT_MIBOX3S.md` | — | port log: addresses, ion / cache / bitness gotchas |
+| `FINDING_ADDRESSES.md` | — | re-deriving `SLOT_PHYS` / `KLN_ADDR` on an unrooted build |
 
 ## 14. License
 

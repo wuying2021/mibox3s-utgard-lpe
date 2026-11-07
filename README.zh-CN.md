@@ -2,6 +2,12 @@
 
 [English](README.md) | **简体中文**
 
+> **本分支面向小米盒子 3S**（MDZ-19-AA，build `8.2.2.817`，Android 6.0.1，内核
+> `3.14.29-301318-g9206404`）。`run.sh` 里已经填好这台机器的两个常量
+> （`SLOT_PHYS=1ee77a0`、`KLN_ADDR=ffffffc00111e5d0`），并驱动本 `Makefile` 编出的两个
+> aarch64 helper；为什么不适用本文其余部分的 MiTV4 地址，见 §2.2 与
+> [PORT_MIBOX3S.md](PORT_MIBOX3S.md)。
+
 一条在 **小米电视 MiTV4**（Amlogic S905L2，Mali-400，Utgard DDK）上经过实测验证的完整链路：
 从无特权的 `adb shell`（uid 2000，`u:r:shell:s0`）拿到 `uid=0` 并让 SELinux 变为 permissive。
 
@@ -46,7 +52,51 @@ kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
 | 缓解措施 | 无 KASLR、**无 PAN**；有 PXN；`panic_on_oops=1`；无 seccomp/userns/bpf |
 | 节点权限 | `/dev/mali` 与 `/dev/ion` 均为 `crw-rw-rw-`（0666） |
 
-### 2.2 其他设备受影响的条件
+### 2.2 已验证的机型（第二台）：小米盒子 3S
+
+| 项 | 值 |
+|---|---|
+| 型号 | 小米**盒子 3S**（MDZ-19-AA），product `queenchristina` |
+| 系统 | Android **6.0.1**（SDK 23），厂商版本号 `8.2.2.817`，安全补丁 2017-04-01 |
+| 内核 | Linux **3.14.29-301318-g9206404**，arm64，构建于 2018-02-02 |
+| SoC / GPU | Amlogic **S905X**，Mali-400，Amlogic Utgard DDK |
+| 内存 | 线性映射 `va = phys + 0xffffffc000000000` |
+| 缓解措施 | SELinux **Enforcing**，无 seccomp；`shell` 的 `CapEff=0`；`/dev/mali`、`/dev/ion` 均为 0666 |
+| 结果 | `uid=0`，`context=u:r:kernel:s0`，`CapEff 0000001fffffffff` —— 详见 `PORT_MIBOX3S.md` |
+
+这台设备比 MiTV4 多了三步，移植到别处之前值得先知道：
+
+1. **本固件的 `/dev/ion` mmap 是坏的。** 对 ion/dma-buf fd 的任何 `mmap()`
+   （包括 `MAP_FIXED`）都返回 `0x400008`。原版 `gpu_arb_write` 因此会在
+   `build_shader()` 里段错误，**GPU job 根本没提交**；只有 `0x400008` 恰好落在
+   该进程已映射段里时才"碰巧能用"。`src/gpwrite.c` 完全绕开 ion：命令缓冲区用
+   普通文件页，物理地址取自 `/proc/self/pagemap`，再用 **external 后端**绑进
+   GPU，提交前 `__ARM_NR_cacheflush`。
+2. **`sys_call_table` 的缓存行是热的。** 它每次系统调用都会被读，GPU（DMA）写
+   只落到 DRAM，而 CPU 继续从 L1/L2 拿旧表项。不冲刷缓存的话，把整个
+   `.data`/`.rodata` 扫一遍也不会命中；`gpwrite64` 和 `kfunc_new` 现在会在
+   探测/调用前走一遍 8 MB 缓冲（`cache_thrash()`），强制该行换出重载。
+3. **位数决定命中哪张表。** 32 位探测走 `compat_sys_call_table`（`.text`），
+   64 位才走 `sys_call_table`。扫描器和调用者都必须是 aarch64。
+
+本 build 的地址：
+
+| 符号 | 地址 |
+|---|---|
+| `sys_call_table` 物理基址 | `0x1ee7000` |
+| `sys_call_table[244]` 物理地址 | `0x1ee77a0` |
+| `kallsyms_lookup_name` | `0xffffffc00111e5d0` |
+| `memcpy` | `0xffffffc0013e1270` |
+| `selinux_enforcing` | `0xffffffc0020cff24` |
+| `core_pattern` | `0xffffffc001f1c0c8` |
+
+**不要照抄 MiTV4 的地址**：它的 `0xffffffc00111f308` 在本机落在
+`do_acct_process.isra.4+0x368` 内部。`kfunc_new bt <addr>` 把
+`dump_backtrace` 变成一个只读的 `%pS` oracle（对任意地址打印
+`symbol+off/size`，不执行、不会崩），本机的 `kallsyms_lookup_name`
+就是这么定位出来的。
+
+### 2.3 其他设备受影响的条件
 
 同时满足以下三条即受影响：
 
@@ -157,10 +207,14 @@ put32(job, 176, pixel_format);             /* 这一笔的宽度 */
 
 ### 4.2 缓存一致性——这里有个坑
 
-- **冷数据**（`lease_break_time`、`core_pattern`、`sys_call_table`）：
-  GPU 的 DMA 写**立即生效**；
+- **冷数据**（`lease_break_time`、`core_pattern`）：GPU 的 DMA 写**立即生效**；
 - **热变量**（`selinux_enforcing`、`panic_on_oops`，每次权限判定都会读、常驻 CPU cache）：
   GPU 直写**完全无效**——`getenforce` 一直是 `Enforcing`，因为 CPU 一直在用缓存里的旧值。
+- `sys_call_table` 介于两者之间，**不能当成冷数据**。它每次系统调用都会被读，
+  缓存行常驻：在小米盒子 3S 上，DMA 写进表里后 CPU 仍读旧表项，把整个
+  `.data`/`.rodata` 扫一遍都不命中。在探测/调用前走一遍几 MB 的缓冲
+  （`src/gpwrite.c` 与 `src/kfunc.c` 里的 `cache_thrash()`）强制该行换出，
+  表项才会从 DRAM 重新加载、劫持才生效。
 
 所以最后一步必须是**CPU 视角的写**（通过被劫持的 `memcpy`），不能用 GPU 写。
 这一点当时花了好几个小时，别忽略。
@@ -396,11 +450,18 @@ GPU 辅助内核利用这个方向的背景资料：
 
 | 文件 | 目标架构 | 作用 |
 |---|---|---|
-| `src/gpu_arb_write.c` | armv7 | 通过 Utgard write-back 单元向任意物理地址写 128 字节 |
+| `src/gpwrite.c` | aarch64 | 绕开 ion 的写原语：普通文件页 + `/proc/self/pagemap` + 外部内存绑定（Mi Box 3S 必须用它） |
+| `src/gpu_arb_write.c` | armv7 | 通过 Utgard write-back 单元向任意物理地址写 128 字节（ion 路径） |
+| `src/gpu_scan.c` | armv7 | 进程内探测循环，用于定位 `sys_call_table[244]` |
 | `src/kfunc.c` | aarch64 | 通过未使用的 `sys_call_table` 槽位调用内核函数 |
-| `run.sh` | — | 驱动整条链 |
+| `src/crash_for_core.c` | armv7 | 放开 `RLIMIT_CORE` 后触发 SIGSEGV，让 `core_pattern` 生效 |
+| `src/kread.c` | aarch64 | physmap canary payload 的 3 参数调用器（用于定位地址） |
+| `run.sh` | — | 驱动整条链（已填 Mi Box 3S 常量） |
 | `roothelper.sh` | — | 由 `core_pattern` 以 root 运行；安装 `su`、修好 adb |
+| `root_cmd.sh` | — | helper 里运行的示例动作（拉起 `tvagent`） |
 | `Makefile` | — | 构建，含 `zig` 目标 |
+| `PORT_MIBOX3S.md` | — | 移植记录：地址、ion / cache / 位宽三个坑 |
+| `FINDING_ADDRESSES.md` | — | 无 root 时如何重新定位 `SLOT_PHYS` / `KLN_ADDR` |
 
 ## 14. 许可证
 
