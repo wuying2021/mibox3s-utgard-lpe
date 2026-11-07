@@ -1,4 +1,4 @@
-# MiTV4 (Amlogic Utgard) — local privilege escalation via unvalidated external memory bind
+# MiBox3S (Amlogic Utgard) — local privilege escalation via unvalidated external memory bind
 
 **English** | [简体中文](README.zh-CN.md)
 
