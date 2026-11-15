@@ -490,6 +490,23 @@ where the driver is fixed.
 | `PORT_MIBOX3S.md` | — | port log: addresses, ion / cache / bitness gotchas |
 | `FINDING_ADDRESSES.md` | — | re-deriving `SLOT_PHYS` / `KLN_ADDR` on an unrooted build |
 
-## 14. License
+## 14. Keywords
+
+**Device / platform** — Xiaomi Mi Box 3S, MiBox3S, MDZ-19-AA, `queenchristina`,
+Xiaomi TV box, set-top box, Android TV, Android 6.0.1, Amlogic S905X, Mali-400,
+Utgard DDK r6p1, kernel 3.14, arm64 / aarch64, armv8l.
+
+**Vulnerability / technique** — local privilege escalation (LPE), root, rooting,
+uid 0, `/dev/mali` (0666), `/dev/ion`, unvalidated external memory bind, GPU
+write-back unit, arbitrary physical write, `sys_call_table`,
+`compat_sys_call_table`, `kallsyms_lookup_name`, kallsyms, `memcpy`, SELinux
+permissive, `core_pattern`, `panic_on_oops`, cache coherency, physmap
+(ret2dir-style), kernel exploitation, proof of concept (PoC).
+
+**Related** — MiTV4 (same driver flaw, different build),
+`mali_mem_validation_check`, Amlogic, CVE-2022-34830, CVE-2022-36449 (neither is
+this bug).
+
+## 15. License
 
 MIT — see `LICENSE`.

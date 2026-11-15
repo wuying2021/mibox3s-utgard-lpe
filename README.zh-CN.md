@@ -463,6 +463,21 @@ GPU 辅助内核利用这个方向的背景资料：
 | `PORT_MIBOX3S.md` | — | 移植记录：地址、ion / cache / 位宽三个坑 |
 | `FINDING_ADDRESSES.md` | — | 无 root 时如何重新定位 `SLOT_PHYS` / `KLN_ADDR` |
 
-## 14. 许可证
+## 14. 关键词
+
+**设备 / 平台** —— 小米盒子 3S、MiBox3S、MDZ-19-AA、`queenchristina`、小米电视盒子、
+机顶盒、Android TV、Android 6.0.1、Amlogic S905X、Mali-400、Utgard DDK r6p1、
+内核 3.14、arm64 / aarch64、armv8l。
+
+**漏洞 / 手法** —— 本地提权（LPE）、root、获取 root、uid 0、`/dev/mali`（0666）、
+`/dev/ion`、外部内存绑定缺少校验、GPU write-back 单元、任意物理写、`sys_call_table`、
+`compat_sys_call_table`、`kallsyms_lookup_name`、kallsyms、`memcpy`、SELinux permissive、
+`core_pattern`、`panic_on_oops`、缓存一致性、physmap（ret2dir 类）、内核利用、
+PoC / 概念验证。
+
+**相关** —— MiTV4（同一驱动缺陷、不同构建）、`mali_mem_validation_check`、Amlogic、
+CVE-2022-34830、CVE-2022-36449（都不是本缺陷）。
+
+## 15. 许可证
 
 MIT —— 见 `LICENSE`。
